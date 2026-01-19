@@ -8,10 +8,13 @@ from queue import Queue
 
 import typer
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 from typing_extensions import Annotated
+
+from pocket_tts.voices.voice_manager import VoiceManager
 
 from pocket_tts.data.audio import stream_audio_chunks
 from pocket_tts.default_parameters import (
@@ -41,6 +44,25 @@ cli_app = typer.Typer(
 # Global model instance
 tts_model = None
 global_model_state = None
+voice_manager: VoiceManager | None = None
+
+
+class VoiceResponse(BaseModel):
+    """Response model for a single voice."""
+
+    name: str
+    source: str
+    file_path: str | None = None
+    transcript: str | None = None
+
+
+class VoicesListResponse(BaseModel):
+    """Response model for the voices list endpoint."""
+
+    voices: list[VoiceResponse]
+    total_count: int
+    predefined_count: int
+    file_count: int
 
 web_app = FastAPI(
     title="Kyutai Pocket TTS API", description="Text-to-Speech generation API", version="1.0.0"
@@ -68,6 +90,50 @@ async def root():
 @web_app.get("/health")
 async def health():
     return {"status": "healthy"}
+
+
+@web_app.get("/v1/voices", response_model=VoicesListResponse)
+async def list_voices(
+    source: str | None = Query(None, description="Filter by source: 'predefined' or 'file'"),
+    refresh: bool = Query(False, description="Rescan voices directory before returning"),
+):
+    """
+    List all available voices.
+
+    Returns predefined voices and file-based voices from the voices/ directory.
+    Use refresh=true to detect newly added voice files without server restart.
+    """
+    if voice_manager is None:
+        raise HTTPException(status_code=503, detail="Voice manager not initialized")
+
+    if refresh:
+        voice_manager.refresh()
+
+    if source == "predefined":
+        voices = voice_manager.get_predefined_voices()
+    elif source == "file":
+        voices = voice_manager.get_file_voices()
+    elif source is None:
+        voices = voice_manager.get_all_voices()
+    else:
+        raise HTTPException(
+            status_code=400, detail="Invalid source filter. Use 'predefined' or 'file'."
+        )
+
+    return VoicesListResponse(
+        voices=[
+            VoiceResponse(
+                name=v.name,
+                source=v.source,
+                file_path=v.file_path,
+                transcript=v.transcript,
+            )
+            for v in voices
+        ],
+        total_count=voice_manager.total_count,
+        predefined_count=voice_manager.predefined_count,
+        file_count=voice_manager.file_count,
+    )
 
 
 def write_to_queue(queue, text_to_generate, model_state):
@@ -133,17 +199,34 @@ def text_to_speech(
 
     # Use the appropriate model state
     if voice_url is not None:
-        if not (
+        # Check if it's a URL or predefined voice
+        if (
             voice_url.startswith("http://")
             or voice_url.startswith("https://")
             or voice_url.startswith("hf://")
             or voice_url in PREDEFINED_VOICES
         ):
+            model_state = tts_model._cached_get_state_for_audio_prompt(voice_url, truncate=True)
+            logging.warning("Using voice from URL: %s", voice_url)
+        elif voice_manager is not None:
+            # Check if it's a file-based voice name
+            file_voices = {v.name: v.file_path for v in voice_manager.get_file_voices()}
+            if voice_url in file_voices:
+                model_state = tts_model._cached_get_state_for_audio_prompt(
+                    file_voices[voice_url], truncate=True
+                )
+                logging.warning("Using file-based voice: %s", voice_url)
+            else:
+                available = list(PREDEFINED_VOICES.keys()) + list(file_voices.keys())
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Voice '{voice_url}' not found. Available voices: {available}",
+                )
+        else:
             raise HTTPException(
-                status_code=400, detail="voice_url must start with http://, https://, or hf://"
+                status_code=400,
+                detail="voice_url must be a URL (http/https/hf) or a known voice name",
             )
-        model_state = tts_model._cached_get_state_for_audio_prompt(voice_url, truncate=True)
-        logging.warning("Using voice from URL: %s", voice_url)
     elif voice_wav is not None:
         # Use uploaded voice file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
@@ -176,18 +259,24 @@ def serve(
     voice: Annotated[
         str, typer.Option(help="Path to voice prompt audio file (voice to clone)")
     ] = DEFAULT_AUDIO_PROMPT,
-    host: Annotated[str, typer.Option(help="Host to bind to")] = "localhost",
-    port: Annotated[int, typer.Option(help="Port to bind to")] = 8000,
+    host: Annotated[str, typer.Option(help="Host to bind to")] = "0.0.0.0",
+    port: Annotated[int, typer.Option(help="Port to bind to")] = 8005,
     reload: Annotated[bool, typer.Option(help="Enable auto-reload")] = False,
+    voices_dir: Annotated[
+        str, typer.Option(help="Directory containing voice files for hot loading")
+    ] = "./voices",
 ):
     """Start the FastAPI server."""
 
-    global tts_model, global_model_state
+    global tts_model, global_model_state, voice_manager
     tts_model = TTSModel.load_model(DEFAULT_VARIANT)
 
     # Pre-load the voice prompt
     global_model_state = tts_model.get_state_for_audio_prompt(voice)
     logger.info(f"The size of the model state is {size_of_dict(global_model_state) // 1e6} MB")
+
+    # Initialize voice manager for /v1/voices endpoint
+    voice_manager = VoiceManager(Path(voices_dir), PREDEFINED_VOICES)
 
     uvicorn.run("pocket_tts.main:web_app", host=host, port=port, reload=reload)
 

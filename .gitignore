@@ -86,4 +86,4 @@ profile_output*
 CLAUDE.md
 QWEN.md
 .claude/
-voices/
+/voices/
