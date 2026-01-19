@@ -1,0 +1,16 @@
+services:
+  pocket-tts:
+    build: .
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./voices:/app/voices:ro
+    environment:
+      - NO_CUDA_GRAPH=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8005/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s

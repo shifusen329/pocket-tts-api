@@ -1,0 +1,15 @@
+[Unit]
+Description=Pocket TTS - Text-to-Speech API Server
+After=network.target
+
+[Service]
+Type=simple
+User=administrator
+WorkingDirectory=/home/administrator/workspace/pocket-tts
+ExecStart=/home/administrator/workspace/pocket-tts/pocket-tts.sh
+Restart=on-failure
+RestartSec=5
+Environment=NO_CUDA_GRAPH=1
+
+[Install]
+WantedBy=multi-user.target

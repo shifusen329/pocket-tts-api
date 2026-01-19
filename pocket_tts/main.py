@@ -64,6 +64,17 @@ class VoicesListResponse(BaseModel):
     predefined_count: int
     file_count: int
 
+
+class SpeechRequest(BaseModel):
+    """OpenAI-compatible request model for speech synthesis."""
+
+    model: str = "pocket-tts"
+    input: str
+    voice: str
+    response_format: str = "wav"
+    speed: float = 1.0
+
+
 web_app = FastAPI(
     title="Kyutai Pocket TTS API", description="Text-to-Speech generation API", version="1.0.0"
 )
@@ -136,6 +147,65 @@ async def list_voices(
     )
 
 
+def _resolve_voice(voice: str) -> dict:
+    """Resolve a voice name to model state."""
+    # Check if it's a URL or predefined voice
+    if (
+        voice.startswith("http://")
+        or voice.startswith("https://")
+        or voice.startswith("hf://")
+        or voice in PREDEFINED_VOICES
+    ):
+        return tts_model._cached_get_state_for_audio_prompt(voice, truncate=True)
+
+    # Check if it's a file-based voice name
+    if voice_manager is not None:
+        file_voices = {v.name: v.file_path for v in voice_manager.get_file_voices()}
+        if voice in file_voices:
+            return tts_model._cached_get_state_for_audio_prompt(
+                file_voices[voice], truncate=True
+            )
+        available = list(PREDEFINED_VOICES.keys()) + list(file_voices.keys())
+        raise HTTPException(
+            status_code=400,
+            detail=f"Voice '{voice}' not found. Available voices: {available}",
+        )
+
+    raise HTTPException(
+        status_code=400,
+        detail="Voice must be a URL (http/https/hf) or a known voice name",
+    )
+
+
+@web_app.post("/v1/audio/speech")
+async def create_speech(request: SpeechRequest):
+    """
+    OpenAI-compatible text-to-speech endpoint.
+
+    Generates audio from the input text using the specified voice.
+    """
+    if not request.input.strip():
+        raise HTTPException(status_code=400, detail="Input text cannot be empty")
+
+    if request.response_format != "wav":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported response format '{request.response_format}'. Only 'wav' is supported.",
+        )
+
+    model_state = _resolve_voice(request.voice)
+    logging.info("Using voice: %s", request.voice)
+
+    return StreamingResponse(
+        generate_data_with_state(request.input, model_state),
+        media_type="audio/wav",
+        headers={
+            "Content-Disposition": "attachment; filename=speech.wav",
+            "Transfer-Encoding": "chunked",
+        },
+    )
+
+
 def write_to_queue(queue, text_to_generate, model_state):
     """Allows writing to the StreamingResponse as if it were a file."""
 
@@ -188,7 +258,7 @@ def text_to_speech(
 
     Args:
         text: Text to convert to speech
-        voice_url: Optional voice URL (http://, https://, or hf://)
+        voice_url: Optional voice name or URL (http://, https://, or hf://)
         voice_wav: Optional uploaded voice file (mutually exclusive with voice_url)
     """
     if not text.strip():
@@ -199,34 +269,7 @@ def text_to_speech(
 
     # Use the appropriate model state
     if voice_url is not None:
-        # Check if it's a URL or predefined voice
-        if (
-            voice_url.startswith("http://")
-            or voice_url.startswith("https://")
-            or voice_url.startswith("hf://")
-            or voice_url in PREDEFINED_VOICES
-        ):
-            model_state = tts_model._cached_get_state_for_audio_prompt(voice_url, truncate=True)
-            logging.warning("Using voice from URL: %s", voice_url)
-        elif voice_manager is not None:
-            # Check if it's a file-based voice name
-            file_voices = {v.name: v.file_path for v in voice_manager.get_file_voices()}
-            if voice_url in file_voices:
-                model_state = tts_model._cached_get_state_for_audio_prompt(
-                    file_voices[voice_url], truncate=True
-                )
-                logging.warning("Using file-based voice: %s", voice_url)
-            else:
-                available = list(PREDEFINED_VOICES.keys()) + list(file_voices.keys())
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Voice '{voice_url}' not found. Available voices: {available}",
-                )
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail="voice_url must be a URL (http/https/hf) or a known voice name",
-            )
+        model_state = _resolve_voice(voice_url)
     elif voice_wav is not None:
         # Use uploaded voice file
         with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_file:
