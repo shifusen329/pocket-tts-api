@@ -5,6 +5,8 @@ services:
       - "8005:8005"
     volumes:
       - ./voices:/app/voices:ro
+    env_file:
+      - .env
     environment:
       - NO_CUDA_GRAPH=1
     restart: unless-stopped
